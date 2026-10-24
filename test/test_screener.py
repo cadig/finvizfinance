@@ -1,7 +1,8 @@
 """Offline fixture tests for the screener views (see test_quote for the pattern)."""
 
+import pandas as pd
 import pytest
-from conftest import blocked_response, html_response, use_session
+from conftest import FakeResponse, blocked_response, html_response, use_session
 
 from finvizfinance.exceptions import FinvizBlockedError, FinvizParseError
 from finvizfinance.screener import get_filter_options, get_filters, get_signal
@@ -107,6 +108,97 @@ def test_screener_ticker_missing_nbsp_no_indexerror():
     use_session(html_response("screener_ticker_no_nbsp.html"))
     tickers = Ticker().screener_view(verbose=0)
     assert tickers == ["AAPL", "MSFT"]
+
+
+# --- redesigned screener (/screener/stocks, Oct 2026) -------------------------
+# Results render as a div[role=grid]; paging metadata lives in the
+# <script data-ssr-props> JSON island. See issue #187.
+
+
+def test_screener_ssr_overview():
+    use_session(html_response("screener_ssr_overview.html"))
+    df = Overview().screener_view(verbose=0)
+    assert list(df.columns) == [
+        "Ticker",
+        "Company",
+        "Sector",
+        "Industry",
+        "Country",
+        "Market Cap",
+        "P/E",
+        "Price",
+        "Change",
+        "Volume",
+    ]
+    # The ticker cell also holds a logo-tile letter; data-ticker is the clean value.
+    assert list(df["Ticker"]) == ["A", "AAPL"]
+    assert list(df["Company"]) == ["Agilent Technologies Inc", "Apple Inc"]
+    # Cells keep the formatted text, so units match the legacy table parser.
+    assert df.loc[0, "Market Cap"] == 48.79e9
+    assert df.loc[0, "Change"] == pytest.approx(-0.0047)
+    assert df.loc[0, "Volume"] == 1760839
+
+
+def test_screener_ssr_multipage():
+    use_session(
+        [
+            html_response("screener_ssr_multi_p1.html"),
+            html_response("screener_ssr_multi_p2.html"),
+        ]
+    )
+    df = Overview().screener_view(verbose=0, sleep_sec=0)
+    assert list(df["Ticker"]) == ["A", "AAPL", "ALB", "ALGN"]
+    # A "-" cell still converts to a missing value.
+    assert pd.isna(df.loc[2, "P/E"])
+
+
+def test_screener_ssr_select_page_past_end_returns_none():
+    use_session(html_response("screener_ssr_overview.html"))
+    assert Overview().screener_view(verbose=0, select_page=2) is None
+
+
+def test_screener_ssr_legacy_labels():
+    # The grid relabels a few columns; they map back to the legacy names.
+    use_session(html_response("screener_ssr_valuation.html"))
+    df = Valuation().screener_view(verbose=0)
+    assert "Fwd P/E" in df.columns and "Forward P/E" not in df.columns
+    assert df.loc[0, "Fwd P/E"] == 25.77
+
+    use_session(html_response("screener_ssr_technical.html"))
+    df = Technical().screener_view(verbose=0)
+    assert {"Change", "Change from Open"} <= set(df.columns)
+    assert "Change %" not in df.columns
+
+
+def test_screener_ssr_no_results_returns_none():
+    use_session(html_response("screener_ssr_noresults.html"))
+    assert Overview().screener_view(verbose=0) is None
+
+
+def test_screener_ssr_missing_grid_raises_parse_error():
+    use_session(html_response("screener_ssr_drift.html"))
+    with pytest.raises(FinvizParseError):
+        Overview().screener_view(verbose=0)
+
+
+def test_screener_ssr_bad_island_raises_parse_error():
+    use_session(
+        FakeResponse(
+            text='<script type="application/json" data-ssr-props="x">{"url": "/"}</script>'
+        )
+    )
+    with pytest.raises(FinvizParseError):
+        Overview().screener_view(verbose=0)
+
+
+def test_screener_ssr_ticker_view():
+    use_session(html_response("screener_ssr_ticker.html"))
+    assert Ticker().screener_view(verbose=0) == ["A", "AAPL", "ABBV"]
+
+
+def test_screener_ssr_ticker_view_limit():
+    use_session(html_response("screener_ssr_ticker.html"))
+    assert Ticker().screener_view(verbose=0, limit=2) == ["A", "AAPL"]
 
 
 def test_screener_get_settings():

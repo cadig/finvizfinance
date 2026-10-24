@@ -33,6 +33,19 @@ class Ticker(Base):
     def _screener_helper(
         self, i: int, page: int, soup: Any, tickers: list[str], limit: int
     ) -> list[str]:
+        data = self._ssr_data(soup)
+        if data is not None:
+            # Redesigned page: the ticker list ships only in the SSR island.
+            page_symbols = [
+                row["text"]["ticker"]
+                for row in data.get("rows") or []
+                if isinstance(row, dict) and row.get("text", {}).get("ticker")
+            ]
+            if i == page - 1:
+                page_symbols = page_symbols[: ((limit - 1) % 1000 + 1)]
+            tickers.extend(page_symbols)
+            return tickers
+
         td = require(
             soup.find("td", class_="screener-tickers"),
             self.url,

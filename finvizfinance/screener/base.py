@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import warnings
 from time import sleep
 from typing import Any
@@ -16,6 +18,7 @@ from typing import Any
 import pandas as pd
 
 from finvizfinance.constants import NUMBER_COL, filter_dict, order_dict, signal_dict
+from finvizfinance.exceptions import FinvizParseError
 from finvizfinance.quote import finvizfinance
 from finvizfinance.util import (
     number_convert,
@@ -26,6 +29,14 @@ from finvizfinance.util import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The redesigned screener (Oct 2026) labels a few columns differently from the
+# old table. Map them back so existing column names keep working.
+LEGACY_LABELS = {
+    "Change %": "Change",
+    "Change from Open %": "Change from Open",
+    "Forward P/E": "Fwd P/E",
+}
 
 
 class Base:
@@ -102,8 +113,36 @@ class Base:
         self._set_ticker(ticker)
         self._set_filters(filters_dict)
 
+    def _ssr_data(self, soup: Any) -> dict | None:
+        """Return the ``data`` payload of the screener's SSR island.
+
+        The redesigned screener embeds its results as JSON in
+        ``<script type="application/json" data-ssr-props>``. Returns ``None``
+        when the island is absent (the legacy table page); an island without a
+        usable ``data`` object is finviz Drift and raises.
+        """
+        tag = soup.find(
+            "script", attrs={"type": "application/json", "data-ssr-props": True}
+        )
+        if tag is None:
+            return None
+        selector = "script[data-ssr-props] data"
+        try:
+            payload = json.loads(tag.string or tag.get_text())
+        except (json.JSONDecodeError, TypeError) as err:
+            raise FinvizParseError(url=self.url, selector=selector) from err
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or not isinstance(data.get("totalCount"), int):
+            raise FinvizParseError(url=self.url, selector=selector)
+        return data
+
     def _get_page(self, soup: Any) -> int:
         """Check the page number"""
+        data = self._ssr_data(soup)
+        if data is not None:
+            total: int = data["totalCount"]
+            page_size: int = data.get("pageSize") or self.size
+            return math.ceil(total / page_size)
         select = soup.find(id="pageSelect")
         if select is None:
             return 0
@@ -119,16 +158,16 @@ class Base:
     ) -> pd.DataFrame:
         """Get screener table helper function.
 
+        Args:
+            rows(list): one list of cells per row, the "No." cell excluded.
         Returns:
             df(pandas.DataFrame): screener information table
         """
-        rows = rows[1:]
         if limit != -1:
             rows = rows[0:limit]
 
         frame = []
-        for row in rows:
-            cols = row.find_all("td")[1:]
+        for cols in rows:
             # Build each row positionally, not keyed by header name: finviz can
             # return duplicate header labels (e.g. two "Dividend" columns in a
             # wide custom view). A name-keyed dict silently collapses those,
@@ -138,11 +177,13 @@ class Base:
             for i, col in enumerate(cols):
                 if i >= len(table_header):
                     break
-                if table_header[i] == "Ticker" and col.has_attr("data-boxover-ticker"):
-                    # The ticker cell nests two anchors (logo/company-ticker +
-                    # a tab-link), so col.text repeats the symbol ("AAPL" ->
-                    # "AAPLAAPL"). The clean value lives in this attribute.
-                    row_values.append(col["data-boxover-ticker"])
+                ticker = col.get("data-boxover-ticker") or col.get("data-ticker")
+                if table_header[i] == "Ticker" and ticker:
+                    # The ticker cell nests extra markup (a logo tile, or a
+                    # second tab-link anchor), so col.text repeats the symbol
+                    # ("AAPL" -> "AAPLAAPL"). The clean value lives in an
+                    # attribute: data-boxover-ticker (legacy) or data-ticker.
+                    row_values.append(ticker)
                 elif i in num_col_index:
                     row_values.append(number_convert(col.text))
                 else:
@@ -163,11 +204,46 @@ class Base:
             "table.screener_table",
         )
 
+    def _screener_grid(self, soup: Any) -> Any:
+        """Locate the redesigned results grid, or raise on a Structural break."""
+        return require(
+            soup.find(attrs={"role": "grid", "aria-label": "Screener results"}),
+            self.url,
+            "div[role=grid] Screener results",
+        )
+
+    @staticmethod
+    def _grid_cells(row: Any, role: str) -> list[Any]:
+        """Cells of a grid row, without the "No." column."""
+        return [
+            cell
+            for cell in row.find_all(attrs={"role": role})
+            if cell.get("data-column-id") != "row"
+        ]
+
     def _parse_table_header(self, soup: Any) -> list[str]:
+        if self._ssr_data(soup) is not None:
+            headers = []
+            for cell in self._grid_cells(self._screener_grid(soup), "columnheader"):
+                # Headers carry a long and a short label ("Change %"/"Chg %").
+                label = cell.find(class_="fv-table_header-label") or cell
+                text = label.get_text(strip=True)
+                headers.append(LEGACY_LABELS.get(text, text))
+            return headers
         table = self._screener_table(soup)
         rows = table.findAll("tr")
         table_headers = [i.text.strip() for i in rows[0].findAll("th")][1:]
         return table_headers
+
+    def _parse_rows(self, soup: Any) -> list[list[Any]]:
+        if self._ssr_data(soup) is not None:
+            grid = self._screener_grid(soup)
+            return [
+                self._grid_cells(row, "gridcell")
+                for row in grid.find_all(attrs={"role": "row", "data-row-key": True})
+            ]
+        table = self._screener_table(soup)
+        return [row.find_all("td")[1:] for row in table.find_all("tr")[1:]]
 
     def _parse_table(
         self, df: pd.DataFrame | None, soup: Any, limit: int
@@ -179,8 +255,7 @@ class Base:
         num_col_index = [
             table_headers.index(i) for i in table_headers if i in NUMBER_COL
         ]
-        table = self._screener_table(soup)
-        rows = table.find_all("tr")
+        rows = self._parse_rows(soup)
         df = self._get_table(rows, df, num_col_index, table_headers, limit)
         return df
 
