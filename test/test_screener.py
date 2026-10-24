@@ -1,5 +1,7 @@
 """Offline fixture tests for the screener views (see test_quote for the pattern)."""
 
+import json
+
 import pandas as pd
 import pytest
 from conftest import (
@@ -290,3 +292,87 @@ def test_screener_util_get_orders_and_columns():
     assert isinstance(get_orders(), list) and len(get_orders()) > 0
     columns = get_custom_screener_columns()
     assert isinstance(columns, dict) and len(columns) > 0
+
+
+def _ssr_grid_page(labels, rows):
+    """A minimal redesigned screener page: grid + SSR island.
+
+    ``labels`` excludes "No."; ``rows`` are lists of cell text, ticker first.
+    """
+    head = "".join(
+        f'<div role="columnheader" aria-colindex="{i + 2}">'
+        f'<span class="fv-table_header-label">{label}</span></div>'
+        for i, label in enumerate(labels)
+    )
+    body = "".join(
+        f'<div role="row" data-row-key="{cells[0]}">'
+        + "".join(
+            f'<div role="gridcell" aria-colindex="{i + 2}">{text}</div>'
+            for i, text in enumerate(cells)
+        )
+        + "</div>"
+        for cells in rows
+    )
+    island = {
+        "data": {
+            "rows": [{"text": {"ticker": cells[0]}} for cells in rows],
+            "totalCount": len(rows),
+            "firstRow": 0,
+            "pageSize": 20,
+        }
+    }
+    return FakeResponse(
+        text=(
+            f'<script type="application/json" data-ssr-props="x">'
+            f"{json.dumps(island)}</script>"
+            f'<div role="grid" aria-label="Screener results" '
+            f'aria-colcount="{len(labels) + 1}">'
+            f'<div role="row"><div role="columnheader" data-column-id="row">'
+            f'<span class="fv-table_header-label">No.</span></div>{head}</div>'
+            f"{body}</div>"
+        )
+    )
+
+
+def test_screener_custom_wide_view_is_chunked():
+    # The grid virtualizes columns past ~38, so a wide custom view is fetched
+    # as narrower chunks (each with Ticker) and joined back on the symbol.
+    columns = list(range(1, 61))  # Ticker + 59 others -> chunks of 28, 28, 3
+    chunks = [list(range(2, 30)), list(range(30, 58)), list(range(58, 61))]
+    tickers = ["AAPL", "MSFT"]
+    pages = []
+    for n, chunk in enumerate(chunks):
+        labels = ["Ticker"] + [f"C{c}" for c in chunk]
+        rows = [[t] + [f"{t}-{c}" for c in chunk] for t in tickers]
+        if n == 1:
+            rows.reverse()  # rows moved between requests: align by ticker
+        pages.append(_ssr_grid_page(labels, rows))
+    session = use_session(pages)
+
+    view = Custom()
+    view.set_filter(filters_dict={"Exchange": "NASDAQ"})
+    df = view.screener_view(columns=columns, verbose=0, sleep_sec=0)
+
+    assert list(df.columns) == ["Ticker"] + [f"C{c}" for c in range(2, 61)]
+    assert list(df["Ticker"]) == tickers
+    assert df.loc[1, "C40"] == "MSFT-40"
+    assert df.loc[0, "C60"] == "AAPL-60"
+    requested = [call["params"]["c"].split(",") for call in session.calls]
+    assert requested == [["0", "1", *map(str, chunk)] for chunk in chunks]
+    # Every chunk keeps the caller's filter.
+    assert all(call["params"].get("f") for call in session.calls)
+    assert columns == list(range(1, 61))  # caller's list untouched
+
+
+def test_screener_custom_wide_view_without_ticker_drops_it():
+    columns = list(range(2, 40))  # 38 non-ticker columns -> chunks of 28, 10
+    pages = [
+        _ssr_grid_page(
+            ["Ticker"] + [f"C{c}" for c in chunk],
+            [["AAPL"] + [str(c) for c in chunk]],
+        )
+        for chunk in (range(2, 30), range(30, 40))
+    ]
+    use_session(pages)
+    df = Custom().screener_view(columns=columns, verbose=0, sleep_sec=0)
+    assert list(df.columns) == [f"C{c}" for c in range(2, 40)]
