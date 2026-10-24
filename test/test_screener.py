@@ -2,7 +2,13 @@
 
 import pandas as pd
 import pytest
-from conftest import FakeResponse, blocked_response, html_response, use_session
+from conftest import (
+    FakeResponse,
+    blocked_response,
+    html_response,
+    load_fixture,
+    use_session,
+)
 
 from finvizfinance.exceptions import FinvizBlockedError, FinvizParseError
 from finvizfinance.screener import get_filter_options, get_filters, get_signal
@@ -199,6 +205,49 @@ def test_screener_ssr_ticker_view():
 def test_screener_ssr_ticker_view_limit():
     use_session(html_response("screener_ssr_ticker.html"))
     assert Ticker().screener_view(verbose=0, limit=2) == ["A", "AAPL"]
+
+
+def test_screener_ssr_ticker_view_missing_rows_raises_parse_error():
+    # totalCount says there are symbols, but the island carries none: Drift.
+    html = load_fixture("screener_ssr_ticker.html")
+    start, end = html.index('"rows":['), html.index('],"totalCount"')
+    use_session(FakeResponse(text=html[:start] + '"rows":[' + html[end:]))
+    with pytest.raises(FinvizParseError):
+        Ticker().screener_view(verbose=0)
+
+
+def test_screener_ssr_page_size_mismatch_raises_parse_error():
+    # Paging steps by Base.size; a different server page size would skip rows.
+    html = load_fixture("screener_ssr_overview.html")
+    use_session(FakeResponse(text=html.replace('"pageSize":20', '"pageSize":50')))
+    with pytest.raises(FinvizParseError):
+        Overview().screener_view(verbose=0)
+
+
+def test_screener_ssr_virtualized_columns_raise_parse_error():
+    # A wide view renders only the columns that fit; aria-colcount counts all.
+    html = load_fixture("screener_ssr_overview.html")
+    use_session(
+        FakeResponse(text=html.replace('aria-colcount="11"', 'aria-colcount="40"'))
+    )
+    with pytest.raises(FinvizParseError):
+        Overview().screener_view(verbose=0)
+
+
+def test_screener_ssr_virtualized_rows_raise_parse_error():
+    # The island lists 2 rows; drop one from the grid.
+    html = load_fixture("screener_ssr_overview.html")
+    use_session(FakeResponse(text=html.replace('data-row-key="AAPL" ', "")))
+    with pytest.raises(FinvizParseError):
+        Overview().screener_view(verbose=0)
+
+
+def test_screener_ssr_header_without_label_raises_parse_error():
+    # Strip the label span from "No." and "Ticker"; the latter must raise.
+    html = load_fixture("screener_ssr_overview.html")
+    use_session(FakeResponse(text=html.replace("fv-table_header-label", "x", 2)))
+    with pytest.raises(FinvizParseError):
+        Overview().screener_view(verbose=0)
 
 
 def test_screener_get_settings():

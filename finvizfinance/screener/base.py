@@ -39,6 +39,17 @@ LEGACY_LABELS = {
 }
 
 
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _colindex(cell: Any) -> int:
+    try:
+        return int(cell.get("aria-colindex", 0))
+    except ValueError:
+        return 0
+
+
 class Base:
     """Base
     Getting information from the finviz screener page.
@@ -48,6 +59,8 @@ class Base:
     url = "https://finviz.com/screener.ashx"
     size = 20
     request_params: dict = {}
+    # (soup, data) of the last parsed SSR island, so one page is decoded once.
+    _ssr_cache: tuple[Any, dict | None] | None = None
 
     def __init__(self) -> None:
         """initiate module"""
@@ -121,6 +134,13 @@ class Base:
         when the island is absent (the legacy table page); an island without a
         usable ``data`` object is finviz Drift and raises.
         """
+        if self._ssr_cache is not None and self._ssr_cache[0] is soup:
+            return self._ssr_cache[1]
+        data = self._load_ssr_data(soup)
+        self._ssr_cache = (soup, data)
+        return data
+
+    def _load_ssr_data(self, soup: Any) -> dict | None:
         tag = soup.find(
             "script", attrs={"type": "application/json", "data-ssr-props": True}
         )
@@ -132,7 +152,7 @@ class Base:
         except (json.JSONDecodeError, TypeError) as err:
             raise FinvizParseError(url=self.url, selector=selector) from err
         data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict) or not isinstance(data.get("totalCount"), int):
+        if not isinstance(data, dict) or not _is_int(data.get("totalCount")):
             raise FinvizParseError(url=self.url, selector=selector)
         return data
 
@@ -140,9 +160,19 @@ class Base:
         """Check the page number"""
         data = self._ssr_data(soup)
         if data is not None:
+            # Paging offsets (r=) and the limit countdown step by self.size, so
+            # a different server page size would skip or repeat rows.
+            page_size = data.get("pageSize", self.size)
+            if page_size != self.size:
+                raise FinvizParseError(
+                    f"Screener page size {page_size!r} at {self.url} does not "
+                    f"match the expected {self.size}. Finviz markup may have "
+                    "changed (Drift).",
+                    url=self.url,
+                    selector="script[data-ssr-props] data.pageSize",
+                )
             total: int = data["totalCount"]
-            page_size: int = data.get("pageSize") or self.size
-            return math.ceil(total / page_size)
+            return math.ceil(total / self.size)
         select = soup.find(id="pageSelect")
         if select is None:
             return 0
@@ -214,19 +244,42 @@ class Base:
 
     @staticmethod
     def _grid_cells(row: Any, role: str) -> list[Any]:
-        """Cells of a grid row, without the "No." column."""
-        return [
+        """Cells of a grid row in column order, without the "No." column.
+
+        The grid splits columns across lanes (pinned left, scrolling center),
+        so order by aria-colindex rather than trusting document order.
+        """
+        cells = [
             cell
             for cell in row.find_all(attrs={"role": role})
             if cell.get("data-column-id") != "row"
         ]
+        return sorted(cells, key=_colindex)
 
     def _parse_table_header(self, soup: Any) -> list[str]:
         if self._ssr_data(soup) is not None:
+            grid = self._screener_grid(soup)
+            cells = self._grid_cells(grid, "columnheader")
+            # The grid virtualizes columns that don't fit the server's assumed
+            # viewport (~38 in a wide custom view): they are counted in
+            # aria-colcount but never rendered. Fail loudly rather than return
+            # a silently narrower table. (+1 for the excluded "No." column.)
+            colcount = grid.get("aria-colcount")
+            if colcount and colcount.isdigit() and len(cells) + 1 < int(colcount):
+                raise FinvizParseError(
+                    f"Screener grid at {self.url} rendered {len(cells) + 1} of "
+                    f"{colcount} columns. Request fewer columns per view.",
+                    url=self.url,
+                    selector="div[role=grid] columnheader",
+                )
             headers = []
-            for cell in self._grid_cells(self._screener_grid(soup), "columnheader"):
+            for cell in cells:
                 # Headers carry a long and a short label ("Change %"/"Chg %").
-                label = cell.find(class_="fv-table_header-label") or cell
+                label = require(
+                    cell.find(class_="fv-table_header-label"),
+                    self.url,
+                    "div[role=columnheader] .fv-table_header-label",
+                )
                 text = label.get_text(strip=True)
                 headers.append(LEGACY_LABELS.get(text, text))
             return headers
@@ -236,12 +289,22 @@ class Base:
         return table_headers
 
     def _parse_rows(self, soup: Any) -> list[list[Any]]:
-        if self._ssr_data(soup) is not None:
+        data = self._ssr_data(soup)
+        if data is not None:
             grid = self._screener_grid(soup)
-            return [
-                self._grid_cells(row, "gridcell")
-                for row in grid.find_all(attrs={"role": "row", "data-row-key": True})
-            ]
+            rows = grid.find_all(attrs={"role": "row", "data-row-key": True})
+            # The island lists every row of the page; fewer rendered grid rows
+            # means the grid virtualized some away.
+            expected = data.get("rows")
+            if isinstance(expected, list) and len(rows) < len(expected):
+                raise FinvizParseError(
+                    f"Screener grid at {self.url} rendered {len(rows)} of "
+                    f"{len(expected)} rows. Finviz markup may have changed "
+                    "(Drift).",
+                    url=self.url,
+                    selector="div[role=row][data-row-key]",
+                )
+            return [self._grid_cells(row, "gridcell") for row in rows]
         table = self._screener_table(soup)
         return [row.find_all("td")[1:] for row in table.find_all("tr")[1:]]
 
